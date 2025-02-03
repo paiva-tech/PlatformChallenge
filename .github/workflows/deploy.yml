@@ -1,0 +1,100 @@
+name: CI/CD - DigAi
+
+on:
+  push:
+    branches:
+      - main  # Roda o pipeline quando um commit é feito na branch main
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v3
+
+      - name: Instalar dependências
+        run: npm install
+        working-directory: parte1
+
+      - name: Rodar testes
+        run: npm test
+        working-directory: parte1
+
+  build-and-push:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    env:
+      ECR_IMAGE: ${{ secrets.ECR_IMAGE }}
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v3
+
+      - name: Configurar credenciais da AWS
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        with:
+          mask-password: true
+
+      - name: Construir e enviar a imagem Docker para ECR
+        run: |
+          echo "Usando a imagem definida no secret: $ECR_IMAGE"
+          docker build -t $ECR_IMAGE -f parte1/Dockerfile parte1/
+          docker push $ECR_IMAGE
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    env:
+      ECR_IMAGE: ${{ secrets.ECR_IMAGE }}
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v3
+
+      - name: Configurar credenciais da AWS
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Obter nomes do Cluster, Serviço e Última Task Definition
+        run: |
+          CLUSTER_NAME=ecs-cluster-digai
+          SERVICE_NAME=service-digai
+          LATEST_TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition digai-task --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+          echo "SERVICE_NAME=$SERVICE_NAME" >> $GITHUB_ENV
+          echo "LATEST_TASK_DEFINITION=$LATEST_TASK_DEFINITION" >> $GITHUB_ENV
+
+      - name: Atualizar Task Definition
+        run: |
+          aws ecs describe-task-definition --task-definition digai-task --query 'taskDefinition' --output json | \
+            jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' > original-task.json
+          jq --arg IMAGE "$ECR_IMAGE" '.containerDefinitions[0].image = $IMAGE' original-task.json > task-definition.json
+          echo "Nova Task Definition:"
+          cat task-definition.json
+          TASK_DEFINITION_ARN=$(aws ecs register-task-definition --cli-input-json file://task-definition.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "TASK_DEFINITION_ARN=$TASK_DEFINITION_ARN" >> $GITHUB_ENV
+
+      - name: Atualizar Serviço ECS
+        run: |
+          aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --task-definition $TASK_DEFINITION_ARN --region $AWS_REGION
+
+      - name: Verificar Health Check e ativar rollback
+        run: |
+          aws ecs wait services-stable --cluster $CLUSTER_NAME --services $SERVICE_NAME --region $AWS_REGION
+          if [ "$(aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --query 'services[0].deployments[?rolloutState==`FAILED`].status' --output text)" == "FAILED" ]; then
+            echo "O deployment falhou! Iniciando rollback..."
+            LAST_REVISION=$(aws ecs describe-task-definition --task-definition digai-task --query 'taskDefinition.revision' --output text)
+            PREVIOUS_REVISION=$((LAST_REVISION-1))
+            aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --task-definition digai-task:$PREVIOUS_REVISION --region $AWS_REGION
+            exit 1
+          fi
